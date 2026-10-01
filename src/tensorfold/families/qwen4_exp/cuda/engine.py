@@ -12,6 +12,86 @@ from . import CONFIDENCE, DEPTH
 
 MAX_DEPTH = 15           # a verify window of at most 16 rows
 KEEP = 8                 # prompt ends a concurrent decoder keeps to resume from
+STORE_ENV = "TENSORFOLD_PREFIX_STORE_GIB"      # GiB of system blocks kept outside
+
+
+def message_starts(model_dir: Path):
+    """``starts(ids)`` -> (the message starts a prefill keeps states at, the system block's end among them or None),
+    found from the checkpoint's chat template exactly as ``tensorfold.cuda.markers.resume_points`` finds them for the
+    27B; None when the template marks no message starts."""
+
+    from tokenizers import Tokenizer
+
+    from tensorfold.cuda.chat_template import ChatTemplate
+    from tensorfold.cuda.markers import TemplateTokens
+    from tensorfold.engine.prefill_plan import message_markers
+
+    model_dir = Path(model_dir)
+    if not (model_dir / "tokenizer.json").is_file():
+        return None
+    try:
+        tokens = TemplateTokens(Tokenizer.from_file(str(model_dir / "tokenizer.json")), ChatTemplate(model_dir))
+        openers, assistant = message_markers(tokens)
+    except (OSError, ValueError, KeyError):
+        return None
+    if not (openers or assistant):
+        return None
+    return starts_from(openers, assistant)
+
+
+def starts_from(openers, assistant):
+    """``message_starts`` over given markers: ``snapshot_points``, plus which point ends a shared system block."""
+
+    import numpy as np
+
+    from tensorfold.cuda.markers import snapshot_points
+
+    points = snapshot_points(openers, assistant)
+    marks, role = np.asarray(openers, dtype=np.int64), [int(t) for t in assistant]
+
+    def starts(ids):
+        found = points(ids)
+        if not len(marks):
+            return found, None
+        arr = np.asarray(ids, dtype=np.int64)
+        at = np.flatnonzero(np.isin(arr, marks))
+        second = int(at[1]) if len(at) > 1 else None
+        # the second message's start ends a shared system block; an assistant message there is a reply, not one
+        if second is None or second not in found or (role and arr[second:second + len(role)].tolist() == role):
+            return found, None
+        return found, second
+
+    return starts
+
+
+def _start_snapshots(t: dict, streams: int) -> int:
+    """Bytes of the snapshots message-start states add: a slot keeps two states, the stock admission counts one."""
+
+    from tensorfold.cuda.geometry import _gdn_dims, layer_counts
+
+    from .multi import PER_SLOT
+
+    linear, _ = layer_counts(t)
+    d, _, _, _, nk, nv, dk, dv, _ = _gdn_dims(t, 1)
+    rec = linear * nv * dk * dv * 4
+    conv = linear * (int(t["linear_conv_kernel_dim"]) - 1) * (2 * nk * dk + nv * dv) * 2
+    tail = (int(t.get("ple_conv_kernel_size", 4)) - 1) * int(t.get("ngram_size", 3)) * int(t.get("hc_count", 1)) * d * 2
+    return max(0, min(KEEP, PER_SLOT * streams) - min(KEEP, streams)) * (rec + conv + tail)
+
+
+def store_bytes() -> int:
+    """The prefix store's size from TENSORFOLD_PREFIX_STORE_GIB (0, the default: system blocks kept in slots only)."""
+
+    import os
+
+    raw = os.environ.get(STORE_ENV, "").strip()
+    try:
+        gib = float(raw) if raw else 0.0
+    except ValueError:
+        raise ValueError(f"{STORE_ENV} must be a number of GiB, not {raw!r}") from None
+    if gib < 0:
+        raise ValueError(f"{STORE_ENV} must be 0 or more, not {raw!r}")
+    return int(gib * 2**30)
 
 
 class FlashNextEngine:
@@ -39,7 +119,7 @@ class FlashNextEngine:
         from .kvcache import BITS_OF, check as check_kv
         from .weights import draft_token_ids, load
         from tensorfold.cuda.capacity import admit, gather_ints
-        from tensorfold.cuda.geometry import gdn_geometry, indexed_stream_geometry, indexed_weights
+        from tensorfold.cuda.geometry import gdn_geometry, indexed_stream_geometry, indexed_weights, with_fixed
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
@@ -64,8 +144,12 @@ class FlashNextEngine:
             self.comm.barrier()
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
+        # message-start states: concurrent streams on one GPU only
+        starts = message_starts(model_dir) if streams > 1 and tp == 1 else None
+        store = store_bytes() if starts is not None else 0
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
-        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
+        geometry = ((lambda text: with_fixed(indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits),
+                                             (_start_snapshots(text, streams) if starts is not None else 0) + store))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits)))
         if exl3:
@@ -107,8 +191,17 @@ class FlashNextEngine:
 
             self.e = None
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype)
+                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype, starts=starts,
+                                      store_bytes=store)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
+            from .multi import ALIGN_CUTS
+
+            note = (f"; system-block states on the {ALIGN_CUTS}-token prefill grid (TENSORFOLD_RESUME_ALIGN)"
+                    if ALIGN_CUTS else "")
+            print(f"[tensorfold] Flash Next message-start states: "
+                  + ("kept, 2 a stream, prefixes copied between streams; prefix store "
+                     f"{self.multi.store.size / 2**30:.2f} GiB ({STORE_ENV}){note}" if starts is not None else
+                     "off (this chat template marks no message starts)"), flush=True)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype)

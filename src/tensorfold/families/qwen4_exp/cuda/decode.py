@@ -248,10 +248,23 @@ def draft(e: Engine, streams: torch.Tensor, next_tokens: Sequence[int], position
     return drafts
 
 
+def chunks(begin: int, n: int, rows: int, cuts: Sequence[int] = ()):
+    """Prompt chunks [start, end) from ``begin`` to ``n``: ``rows`` at most, and one ending at every cut."""
+
+    start = begin
+    for stop in [*sorted({int(c) for c in cuts if begin < c < n}), n]:
+        while start < stop:
+            end = min(start + rows, stop)
+            yield start, end
+            start = end
+
+
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True,
-            resume: dict | None = None, constraint=None) -> int:
-    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run."""
+            resume: dict | None = None, constraint=None, stops: Sequence[int] = (), keep=None) -> int:
+    """Commit the prompt in chunks, sample the first token; rows ignore chunking, so ``resume`` equals a fresh run.
+    ``keep(p, snapshot, tail)`` hears the state after each of ``stops`` (a chunk ends there): what resuming at ``p``
+    needs, the MTP head one entry short as at a prompt's end."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
@@ -268,22 +281,29 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         if use_mtp and resume.get("tail") is not None:
             mtp_forward(w, st, pb, [prompt[begin]], resume["tail"])
             st.set_mtp_len(st.mtp_len + 1)
+    cuts = sorted({int(p) for p in stops if begin < p < len(prompt)}) if keep is not None else []
     last = None
-    for start in range(begin, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
+    for start, end in chunks(begin, len(prompt), e.prefill_rows, cuts):
+        chunk = list(prompt[start:end])
         R = len(chunk)
-        final = start + R >= len(prompt)
+        final = end >= len(prompt)
         # only the prompt's last row is sampled: the head runs on the final chunk alone
         logits = forward(w, st, pb, chunk, logits=final)
         if final:
             last = logits.clone()
         streams_last = pb.streams[R - 1:R].clone()
         if use_mtp:
-            nxt = list(prompt[start + 1:start + R + 1])
+            nxt = list(prompt[start + 1:end + 1])
             if nxt:
                 mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
                 st.set_mtp_len(st.mtp_len + len(nxt))
         commit(w, st, pb, R, R)
+        if not final and end in cuts:
+            # the head has taken (stream end - 1, token end): resuming takes that pair again with its own token
+            snap = st.snapshot()
+            if use_mtp:
+                snap["mtp_len"] -= 1
+            keep(end, snap, streams_last if use_mtp else None)
     if constraint is not None:                           # a reply's grammar: this rank's vocabulary columns
         last = constraint.mask(last, None, e.w.meta.get("vocab_offset", 0))
     first = e.sample(last, [len(prompt)], sampling)[0]

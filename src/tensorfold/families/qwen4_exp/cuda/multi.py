@@ -1,12 +1,18 @@
 """Flash Next's concurrent rounds on one GPU: every stream keeps exactly its own accepted prefix."""
+# Message-start states (ashhart/TensorFold#169). Prefill keeps states at the chat template's
+# message starts (``starts``), a slot keeps two (its shortest, a system block, and its newest), a kept prefix's rows
+# are copied into whichever slot a request gets, and a store outside the slots (TENSORFOLD_PREFIX_STORE_GIB) keeps
+# system blocks, so a new conversation that shares only its system block resumes after it.
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
 import torch
 
+from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
@@ -18,6 +24,14 @@ from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
 from ..cuda import CONFIDENCE, DEPTH
 
+PER_SLOT = 2            # kept states a slot holds: its shortest (a system block) and its newest
+ALIGN = 256             # bytes: where each of a stored state's tensors starts in the store's buffer
+LOG = os.environ.get("TENSORFOLD_RESUME_LOG", "") not in ("", "0")      # one line of numbers per admission
+# TENSORFOLD_RESUME_ALIGN=2048 (default 0: off) puts the system block's kept state on the prefill grid below the message start, so a
+# resumed prompt's chunks are exactly the stock plan's suffix: equal to a fresh run by construction, for about 1,000 tokens read again
+ALIGN_CUTS = int(os.environ.get("TENSORFOLD_RESUME_ALIGN", "0") or 0)
+
+
 def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int) -> Engine:
     """A one-sequence engine over a slot's state and the shared buffers (eager: no CUDA graphs)."""
 
@@ -27,11 +41,162 @@ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: in
     return e
 
 
+# -- a kept prefix's rows: in a slot, or stored outside the slots ---------------------------------------------------
+def _kv_parts(cache, rows: int) -> list:
+    return [(t, rows) for t in ([cache.k, cache.v] + ([cache.ks, cache.vs] if cache.quantized else []))]
+
+
+def _parts(st, n: int, ratio: int) -> list:
+    """(tensor, rows) of every cache a state of ``n`` tokens reads below them: each attention layer's keys and values
+    (and their scales), indexer keys and complete pooled blocks, then the MTP head's, which hold ``n - 1`` entries."""
+
+    out = []
+    for kv, ikc, pooled in zip(st.kc, st.ikc, st.pooled):
+        out += _kv_parts(kv, n) + [(ikc, n), (pooled, n // ratio)]
+    if getattr(st, "mtp_kc", None) is not None:
+        m = n - 1
+        out += _kv_parts(st.mtp_kc, m) + [(st.mtp_ikc, m), (st.mtp_pooled, m // ratio)]
+    return out
+
+
+def copy_prefix(src, dst, n: int, ratio: int) -> None:
+    """Rows [0, n) of every attention cache (the MTP head's [0, n - 1)), ``src`` to ``dst``, slots or stored rows alike:
+    with the kept snapshot restored over them, ``dst`` resumes the prefix exactly as ``src`` would."""
+
+    a, b = _parts(src, n, ratio), _parts(dst, n, ratio)
+    if len(a) != len(b):
+        raise RuntimeError("a kept prefix's caches do not match the slot's")
+    for (x, rows), (y, _) in zip(a, b):
+        if rows:
+            y[:rows].copy_(x[:rows])
+
+
+class _KV:
+    """A stored copy of a KV cache's first rows: the attributes ``copy_prefix`` reads."""
+
+    def __init__(self, k, v, ks, vs, quantized: bool) -> None:
+        self.k, self.v, self.ks, self.vs, self.quantized = k, v, ks, vs, quantized
+
+
+def _aligned(nbytes: int) -> int:
+    return -(-int(nbytes) // ALIGN) * ALIGN
+
+
+def _spec(st: State, n: int, ratio: int, snap: dict, tail) -> list[tuple[torch.dtype, tuple[int, ...]]]:
+    """The tensors a stored state of ``n`` tokens holds, in order: its rows, then its snapshot's DeltaNet, conv and
+    n-gram states and its MTP tail."""
+
+    out = [(t.dtype, (rows, *t.shape[1:])) for t, rows in _parts(st, n, ratio)]
+    out += [(snap[k].dtype, tuple(snap[k].shape)) for k in ("rec", "conv", "ple_tail")]
+    return out + ([(tail.dtype, tuple(tail.shape))] if tail is not None else [])
+
+
+def _size(spec) -> int:
+    return sum(_aligned(torch.empty((), dtype=d).element_size() * int(np.prod(s))) for d, s in spec)
+
+
+class Rows:
+    """A system block's kept state outside the slots: its attention rows and snapshot, views of the store's buffer."""
+
+    def __init__(self, buf: torch.Tensor, at: int, spec, st: State, tail: bool) -> None:
+        views, off = [], at
+        for dtype, shape in spec:
+            nbytes = torch.empty((), dtype=dtype).element_size() * int(np.prod(shape))
+            views.append(buf[off:off + nbytes].view(dtype).view(shape))
+            off += _aligned(nbytes)
+        self.at, self.nbytes = at, off - at
+        it = iter(views)
+        quantized = bool(st.kc and st.kc[0].quantized)
+
+        def kv() -> _KV:
+            k, v = next(it), next(it)
+            ks, vs = (next(it), next(it)) if quantized else (None, None)
+            return _KV(k, v, ks, vs, quantized)
+
+        self.kc, self.ikc, self.pooled = [], [], []
+        for _ in st.kc:
+            self.kc.append(kv())
+            self.ikc.append(next(it))
+            self.pooled.append(next(it))
+        if getattr(st, "mtp_kc", None) is not None:
+            self.mtp_kc, self.mtp_ikc, self.mtp_pooled = kv(), next(it), next(it)
+        self.rec, self.conv, self.ple_tail = next(it), next(it), next(it)
+        self.tail = next(it) if tail else None
+
+
+class Store:
+    """System-block states kept outside the slots, in one buffer allocated at startup: first fit, and the least
+    recently used leaves first when a new one needs the room."""
+
+    def __init__(self, nbytes: int, device) -> None:
+        self.size = max(0, int(nbytes)) // ALIGN * ALIGN
+        # zeros, not empty: the pages are committed at startup (as the slots' are), so the memory the store costs shows in the first
+        # reading and the startup estimate, not later as it fills
+        self.buf = torch.zeros((self.size,), dtype=torch.uint8, device=device) if self.size else None
+        self.entries: list[tuple[list[int], Rows, dict, torch.Tensor | None]] = []      # least recently used first
+
+    def find(self, ids: list[int]):
+        return next((e for e in self.entries if len(e[0]) == len(ids) and e[0] == ids), None)
+
+    def touch(self, entry) -> None:
+        if any(e is entry for e in self.entries):
+            self.entries = [e for e in self.entries if e is not entry] + [entry]
+
+    def _fit(self, need: int) -> int | None:
+        start = 0
+        for a, b in sorted((e[1].at, e[1].at + e[1].nbytes) for e in self.entries):
+            if a - start >= need:
+                return start
+            start = max(start, b)
+        return start if self.size - start >= need else None
+
+    def add(self, ids: list[int], st: State, snap: dict, tail, ratio: int):
+        """Store the state of slot ``st`` after ``ids`` (its rows below ``len(ids)`` and ``snap``), unless held."""
+
+        if self.buf is None:
+            return None
+        held = self.find(ids)
+        if held is not None:
+            self.touch(held)
+            return held
+        spec = _spec(st, len(ids), ratio, snap, tail)
+        need = _size(spec)
+        if need > self.size:
+            return None
+        at = self._fit(need)
+        while at is None and self.entries:
+            self.entries.pop(0)
+            at = self._fit(need)
+        if at is None:
+            return None
+        rows = Rows(self.buf, at, spec, st, tail is not None)
+        copy_prefix(st, rows, len(ids), ratio)
+        rows.rec.copy_(snap["rec"])
+        rows.conv.copy_(snap["conv"])
+        rows.ple_tail.copy_(snap["ple_tail"])
+        if tail is not None:
+            rows.tail.copy_(tail)
+        kept = {**snap, "rec": rows.rec, "conv": rows.conv, "ple_tail": rows.ple_tail,
+                "ple_history": None if snap["ple_history"] is None else snap["ple_history"].copy()}
+        entry = (list(ids), rows, kept, rows.tail)
+        self.entries.append(entry)
+        return entry
+
+
+def _owned(snap: dict, tail):
+    """A stored snapshot's copy with tensors of its own (the store's buffer is reused when an entry leaves)."""
+
+    own = {**snap, "rec": snap["rec"].clone(), "conv": snap["conv"].clone(), "ple_tail": snap["ple_tail"].clone(),
+           "ple_history": None if snap["ple_history"] is None else snap["ple_history"].copy()}
+    return own, None if tail is None else tail.clone()
+
+
 class MultiDecoder:
     """Rounds over the live streams; ``slots`` streams at most, each with ``capacity`` tokens of context."""
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
-                 stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16") -> None:
+                 stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", starts=None,
+                 store_bytes: int = 0) -> None:
         if w.comm is not None:
             raise ValueError("concurrent Flash Next runs on one GPU for now")
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
@@ -47,6 +212,10 @@ class MultiDecoder:
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        self.starts = starts          # prompt -> (message starts to keep, the system block's end among them), or None
+        self.slots = list(self.free)
+        self.used: dict[int, int] = {}                     # each slot's last admission (least recently used goes first)
+        self.store = Store(store_bytes if starts is not None else 0, w.device)
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in self.streams.values()}
@@ -54,30 +223,83 @@ class MultiDecoder:
     def _drop_kept(self, st: State) -> None:
         self.kept = [k for k in self.kept if k[1] is not st]
 
+    def _rebuild(self, entry, st, staying) -> int:
+        """Tokens someone would read again to get ``entry`` back once slot ``st`` loses it: its length less the longest prefix
+        of it still kept, by another slot, the store, or ``st``'s own states that stay (``staying``)."""
+
+        ids, n = entry[0], len(entry[0])
+        store = getattr(self, "store", None)
+        keep = 0
+        for k in [*(k for k in self.kept if k[1] is not st), *staying, *(store.entries if store is not None else ())]:
+            m = len(k[0])
+            if keep < m <= n and k[0][-1] == ids[m - 1] and ids[:m] == k[0]:
+                keep = m
+        return n - keep
+
     def _slot_for(self, prompt: list[int], reuse: bool):
-        """The idle kept slot the prompt extends furthest, else a free slot, else the oldest idle kept one."""
+        """(slot, resume or None, cached tokens). The longest kept state the prompt strictly extends, a slot's or the
+        store's, resumes in its own idle slot when that loses nothing; else in a free slot; else in the idle slot whose
+        loss costs least: the fewest tokens anyone would read again for the states it drops (each one's length less the
+        longest prefix of it kept elsewhere), then no copy, then the least recently used. So a one-off request's leftovers
+        go before a running conversation, and a system block nothing else keeps costs its whole length.
+        ``resume["copy"]`` names where the prefix's rows come from when not in that slot."""
 
         busy = self._busy()
+        store = getattr(self, "store", None)
         best = None
-        for k in self.kept if reuse else []:
-            ids, st = k[0], k[1]
-            if id(st) not in busy and len(ids) < len(prompt) and prompt[:len(ids)] == ids and \
-                    (best is None or len(ids) > len(best[0])):
+        for k in [*self.kept, *(store.entries if store is not None else ())] if reuse else []:
+            ids = k[0]
+            if len(ids) < len(prompt) and (best is None or len(ids) > len(best[0])) and prompt[:len(ids)] == ids:
                 best = k
-        if best is not None:
-            self._drop_kept(best[1])
-            return best[1], {"state": best[2], "tail": best[3]}, len(best[0])
-        if not self.free:
-            idle = next((k[1] for k in self.kept if id(k[1]) not in busy), None)
-            if idle is None:
-                raise RuntimeError("no free stream slot")
-            self._drop_kept(idle)
-            self.free.append(idle)
-        return self.free.pop(), None, 0
+        slots = list(self.free)
+        for k in self.kept:
+            if id(k[1]) not in busy and all(s is not k[1] for s in slots):
+                slots.append(k[1])
+        if not slots:
+            raise RuntimeError("no free stream slot")
+        used = getattr(self, "used", {})
+        n = 0 if best is None else len(best[0])
+        options = []
+        for st in slots:
+            mine = [k for k in self.kept if k[1] is st]
+            own = None if best is None else next((k for k in mine if len(k[0]) == n and k[0] == best[0]), None)
+            lost = [k for k in mine if own is None or len(k[0]) > n]
+            source = None
+            if best is not None and own is None:     # the same prefix in another slot first, else where it was found
+                source = next((k for k in self.kept if k[1] is not st and len(k[0]) == n and k[0] == best[0]), best)
+            staying = [k for k in mine if not any(k is x for x in lost)]
+            cost = sum(self._rebuild(k, st, staying) for k in lost)
+            options.append(((cost, int(source is not None), used.get(id(st), -1)), st, own, source))
+        _, st, own, source = min(options, key=lambda o: o[0])
+        self.free = [f for f in self.free if f is not st]
+        if best is None:
+            self._drop_kept(st)
+            return st, None, 0
+        if own is not None:                          # in place: the states past the resumed one are overwritten
+            self.kept = [k for k in self.kept if k[1] is not st or len(k[0]) <= n]
+            self._touch(own)
+            return st, {"state": own[2], "tail": own[3]}, n
+        self._drop_kept(st)
+        if store is not None and any(e is source for e in store.entries):
+            store.touch(source)
+        else:
+            self._touch(source)
+        return st, {"state": source[2], "tail": source[3], "copy": source[1], "ids": source[0]}, n
+
+    def _touch(self, entry) -> None:
+        if any(k is entry for k in self.kept):
+            self.kept = [k for k in self.kept if k is not entry] + [entry]
 
     def _remember(self, ids: list[int], st: State, snap: dict, tail) -> None:
-        gone = [k[1] for k in self.kept if k[0] == ids]
-        self.kept = [k for k in self.kept if k[0] != ids] + [(ids, st, snap, tail)]
+        """Keep slot ``st``'s state after ``ids``: a slot keeps its shortest and its newest, ``keep`` in all."""
+
+        gone = [k[1] for k in self.kept if k[1] is st and k[0] == ids]
+        entry = (ids, st, snap, tail)
+        self.kept = [k for k in self.kept if not (k[1] is st and k[0] == ids)] + [entry]
+        mine = [k for k in self.kept if k[1] is st]
+        if len(mine) > PER_SLOT:
+            base = min(mine, key=lambda k: len(k[0]))
+            self.kept = [k for k in self.kept if k[1] is not st or k is base or k is entry]
         while len(self.kept) > self.keep:
             gone.append(self.kept.pop(0)[1])
         busy = self._busy()
@@ -85,6 +307,31 @@ class MultiDecoder:
             if old is not st and id(old) not in busy and all(k[1] is not old for k in self.kept) and \
                     all(f is not old for f in self.free):
                 self.free.append(old)
+
+    def _points(self, prompt: list[int]) -> tuple[list[int], int | None]:
+        """The prompt's message starts and its system block's end among them (none without template markers)."""
+
+        if getattr(self, "starts", None) is None:
+            return [], None
+        try:
+            found, shared = self.starts(prompt)
+            return [int(p) for p in found], (None if shared is None else int(shared))
+        except Exception:                            # noqa: BLE001  (a prompt the markers cannot read keeps its end)
+            return [], None
+
+    def _store_shared(self, prompt: list[int], st: State, shared: int | None) -> None:
+        """The store keeps the prompt's system block too, from the slot that now holds its rows."""
+
+        if shared is None or self.store.buf is None:
+            return
+        ids = prompt[:shared]
+        entry = next((k for k in self.kept if k[1] is st and len(k[0]) == shared and k[0] == ids), None)
+        if entry is not None:
+            self.store.add(ids, st, entry[2], entry[3], self.w.cfg.index_ratio)
+
+    def _name(self, x) -> str:
+        slots = getattr(self, "slots", [])
+        return next((f"slot {i}" for i, s in enumerate(slots) if s is x), "store" if isinstance(x, Rows) else "?")
 
     def live(self) -> int:
         return len(self.streams)
@@ -104,26 +351,60 @@ class MultiDecoder:
 
     @torch.no_grad()
     def admit(self, s: Stream) -> None:
-        """Prefill a request in a free slot, draft its first chain and emit its first token."""
+        """Prefill a request in a slot (resuming the longest kept state its prompt extends, keeping its message starts),
+        draft its first chain and emit its first token."""
 
         room = self.capacity - len(s.prompt) - self.depth - 1
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
         s.count = max(1, min(s.count, room))
         t0 = time.perf_counter()
-        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft)
+        prompt = list(s.prompt)
+        st, resume, s.cached = self._slot_for(prompt, s.draft)
+        if id(st) in self._busy():
+            raise RuntimeError("a live stream's slot was chosen for another request")
         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+        found, shared = self._points(prompt) if s.draft and getattr(s, "vision", None) is None else ([], None)
+        if ALIGN_CUTS and shared is not None:         # the system block's state sits on the prefill grid (see ALIGN_CUTS)
+            aligned = shared // ALIGN_CUTS * ALIGN_CUTS
+            found = [aligned if p == shared else p for p in found]
+            found = [p for p in found if p >= MIN_GAP]
+            shared = aligned if aligned >= MIN_GAP else None
+        stops = [p for p in found if s.cached + MIN_GAP <= p < len(prompt)]
+
+        def keep(p: int, snap: dict, tail) -> None:
+            self._remember(prompt[:p], st, {**snap, "start": True, "shared": p == shared}, tail)
+
+        source = None if resume is None else resume.get("copy")
         try:
-            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume,
+            if source is not None:                   # the kept prefix's rows are elsewhere: they come over first
+                copy_prefix(source, st, s.cached, self.w.cfg.index_ratio)
+                snap, tail = (_owned(resume["state"], resume["tail"]) if isinstance(source, Rows)
+                              else (resume["state"], resume["tail"]))
+                self._remember(list(resume["ids"]), st, snap, tail)
+            first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, stops=stops,
+                            keep=keep if stops else None,
                             **({} if s.constraint is None else {"constraint": s.constraint}))
         except Exception:
-            self.free.append(st)
+            self._drop_kept(st)
+            if all(f is not st for f in self.free):
+                self.free.append(st)
             raise
         s.sid, s.st = self.next_id, st
         self.next_id += 1
-        if s.draft:                    # the prompt's state; the MTP head has absorbed every position but the last
-            self._remember(list(s.prompt), st, st.snapshot(), e.last_streams.clone() if mtp else None)
+        self.used[id(st)] = s.sid
+        if s.draft and not (stops and len(prompt) - stops[-1] < MIN_GAP):   # the end, unless a start sits just before it
+            # the prompt's state; the MTP head has absorbed every position but the last
+            self._remember(prompt, st, st.snapshot(), e.last_streams.clone() if mtp else None)
+        self._store_shared(prompt, st, shared)
+        if LOG:
+            how = "fresh" if resume is None else (f"copied from {self._name(source)}" if source is not None
+                                                  else "in place")
+            print(f"[tensorfold] resume: request {s.sid} prompt {len(prompt)} cached {s.cached} ({how}) into "
+                  f"{self._name(st)}; stops {stops}; {self._name(st)} keeps "
+                  f"{[len(k[0]) for k in self.kept if k[1] is st]}; store keeps "
+                  f"{[len(k[0]) for k in self.store.entries]}", flush=True)
         s.context = list(s.prompt)
         s.drafts = draft(e, e.last_streams, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
                          self.confidence) if mtp and s.count > 1 else []
